@@ -1,0 +1,42 @@
+name: Refresh market prices
+
+# Scrapes warframe.market every 6 hours and commits prices.json to THIS repo.
+# The Foundry Tree app fetches it at runtime from raw.githubusercontent.com,
+# so price refreshes never touch the main repo and never trigger a site deploy.
+on:
+  schedule:
+    - cron: "23 */6 * * *"   # every 6h, offset from the top of the hour
+  workflow_dispatch: {}       # manual "Run workflow" button
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh-prices
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build prices.json
+        run: python build_prices.py
+
+      - name: Commit & push if changed
+        run: |
+          git config user.name "aksel"
+          git config user.email "aksel@stendahl.no"
+          git add prices.json
+          if git diff --cached --quiet; then
+            echo "No changes — nothing to commit."
+          else
+            git commit -m "chore: market price refresh"
+            git push
+          fi
