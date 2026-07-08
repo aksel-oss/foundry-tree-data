@@ -34,14 +34,23 @@ DAYS = 3
 
 
 def fetch(url):
-    res = subprocess.run(
-        ["curl", "-sSL", "--fail", "-H", "Accept: application/json",
-         "-H", "Platform: pc", "-H", "User-Agent: wf-tree-prices", url],
-        capture_output=True, timeout=60,
-    )
+    # Any single-request failure (hang, non-2xx, truncated JSON) returns None; the
+    # per-item loops count it as an error and move on. A hung curl once killed the
+    # whole run via an unhandled TimeoutExpired — 2026-07-06, run 28797746620.
+    try:
+        res = subprocess.run(
+            ["curl", "-sSL", "--fail", "--max-time", "45", "-H", "Accept: application/json",
+             "-H", "Platform: pc", "-H", "User-Agent: wf-tree-prices", url],
+            capture_output=True, timeout=60,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
     if res.returncode != 0:
         return None
-    return json.loads(res.stdout.decode("utf-8"))
+    try:
+        return json.loads(res.stdout.decode("utf-8"))
+    except ValueError:
+        return None
 
 
 def main():
