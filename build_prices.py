@@ -31,35 +31,67 @@ RECIPES_URL = "https://foundry-tree.netlify.app/data/recipes.json"
 WFM_API = "https://api.warframe.market/v1/items"
 WFM_V2 = "https://api.warframe.market/v2/items"
 DAYS = 3
+STALE_H = 24  # how long an upstream outage may stay quiet before the run fails loudly
 
 
-def fetch(url):
+def fetch(url, tries=1, gap=30):
     # Any single-request failure (hang, non-2xx, truncated JSON) returns None; the
     # per-item loops count it as an error and move on. A hung curl once killed the
     # whole run via an unhandled TimeoutExpired — 2026-07-06, run 28797746620.
+    # `tries` > 1 is for the two index fetches only — the per-item loop must stay at
+    # one attempt or a bad API day would run past the job's 30-minute timeout.
+    for n in range(tries):
+        if n:
+            time.sleep(gap * n)
+        try:
+            res = subprocess.run(
+                ["curl", "-sSL", "--fail", "--max-time", "45", "-H", "Accept: application/json",
+                 "-H", "Platform: pc", "-H", "User-Agent: wf-tree-prices", url],
+                capture_output=True, timeout=60,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+        if res.returncode != 0:
+            continue
+        try:
+            return json.loads(res.stdout.decode("utf-8"))
+        except ValueError:
+            continue
+    return None
+
+
+def skip(msg):
+    """Upstream is down, not broken.
+
+    warframe.market goes behind a Cloudflare 5xx for half an hour at a time
+    (2026-07-31, run 30619556779: 521 on every endpoint, site root included).
+    Failing the run for that just mails a failure notice about someone else's
+    server, so keep the last prices.json and end quietly — but only while it is
+    still fresh. Past STALE_H the outage is no longer a blip and the email is
+    worth having.
+    """
+    age = None
     try:
-        res = subprocess.run(
-            ["curl", "-sSL", "--fail", "--max-time", "45", "-H", "Accept: application/json",
-             "-H", "Platform: pc", "-H", "User-Agent: wf-tree-prices", url],
-            capture_output=True, timeout=60,
-        )
-    except (subprocess.TimeoutExpired, OSError):
-        return None
-    if res.returncode != 0:
-        return None
-    try:
-        return json.loads(res.stdout.decode("utf-8"))
-    except ValueError:
-        return None
+        with open(OUT) as f:
+            gen = json.load(f)["generated"]
+        age = (datetime.datetime.now(datetime.timezone.utc)
+               - datetime.datetime.fromisoformat(gen)).total_seconds() / 3600
+    except (OSError, KeyError, ValueError, TypeError):
+        age = None
+    if age is None or age > STALE_H:
+        old = "no readable prices.json" if age is None else f"prices.json is {age:.0f}h old"
+        print(f"ERROR: {msg} — {old}", file=sys.stderr)
+        sys.exit(1)
+    print(f"SKIP: {msg} — keeping prices.json ({age:.1f}h old)")
+    sys.exit(0)
 
 
 def main():
     # 1) Load recipes from the live site to know which uniqueNames we care about
     print(f"Fetching {RECIPES_URL} ...")
-    recipes = fetch(RECIPES_URL)
+    recipes = fetch(RECIPES_URL, tries=3)
     if not recipes or "items" not in recipes:
-        print("ERROR: could not fetch recipes.json from the live site", file=sys.stderr)
-        sys.exit(1)
+        skip("could not fetch recipes.json from the live site")
     our_items = recipes.get("items", {})
     our_recipes = recipes.get("recipes", {})
 
@@ -77,10 +109,9 @@ def main():
 
     # 2) Fetch warframe.market item index and build gameRef -> slug mapping
     print("Fetching warframe.market item index...")
-    idx = fetch(WFM_V2)
+    idx = fetch(WFM_V2, tries=3)
     if not idx or "data" not in idx:
-        print("ERROR: could not fetch item index", file=sys.stderr)
-        sys.exit(1)
+        skip("could not fetch the warframe.market item index")
 
     ref_to_slug = {}
     for item in idx["data"]:
@@ -164,10 +195,9 @@ def main():
             print(f"  relics: {i + 1}/{len(relic_slugs)}...")
     print(f"  {len(relic_prices)} relic prices fetched")
 
-    # Sanity floor: a near-empty result means the API was down — keep the old file
+    # Sanity floor: a near-empty result means the API died mid-run — keep the old file
     if len(prices) < 100:
-        print(f"ERROR: only {len(prices)} prices fetched — refusing to overwrite", file=sys.stderr)
-        sys.exit(1)
+        skip(f"only {len(prices)} prices fetched — refusing to overwrite")
 
     # 6) Write output
     payload = {
